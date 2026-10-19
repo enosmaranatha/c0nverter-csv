@@ -1,139 +1,109 @@
-"""
-app.py  -  Streamlit: Konversi dokumen standar ISO (PDF) -> CSV untuk R / RStudio
-
-Jalankan:
-    pip install -r requirements.txt
-    streamlit run app.py
-"""
-import io
-import re
-import zipfile
-
-import pandas as pd
 import streamlit as st
+import pandas as pd
+import io
 
-from iso_parser import parse_iso_pdf
+# Konfigurasi Halaman
+st.set_page_config(page_title="Konverter Standar ke Biblioshiny", layout="wide")
+st.title("🔌 Konverter Data Standar EV ke CSV R-Studio (Biblioshiny)")
+st.write("Aplikasi ini membantu memformat daftar dokumen standar (ISO/IEC/UNECE) agar kolomnya sesuai dengan format Scopus dan bisa dianalisis di R-Studio.")
 
-st.set_page_config(page_title="ISO PDF → CSV", page_icon="📄", layout="wide")
-st.title("📄 ISO Standard PDF → CSV (siap untuk R / RStudio)")
-st.caption("Unggah satu atau beberapa PDF standar ISO (PDF harus punya text layer, bukan hasil scan).")
+# Inisialisasi DataFrame kosong di Session State
+if 'df_standar' not in st.session_state:
+    st.session_state.df_standar = pd.DataFrame(columns=['TI', 'AB', 'PY', 'SO', 'AU', 'DT', 'DE'])
 
-DESCRIPTIONS = {
-    "document_info": "Metadata dokumen & ringkasan jumlah elemen",
-    "clauses": "Struktur klausul (id, level, parent, judul, teks gabungan)",
-    "blocks": "Semua blok teks: paragraph / requirement / note / example / list_item",
-    "requirements": "Requirement berkode [XXX-000] + modalitas (shall/should/may/can) + referensi silang",
-    "terms": "Istilah & definisi (klausul 3)",
-    "abbreviations": "Singkatan (klausul 4)",
-    "normative_references": "Rujukan normatif (klausul 2)",
-    "tables_index": "Daftar tabel (id, caption, halaman, kolom)",
-    "tables_long": "Isi semua tabel format panjang (tidy): table_id, row, col, value",
-    "figures": "Daftar gambar & caption",
-    "keywords_unigram": "Frekuensi kata (untuk word cloud / TreeMap di R)",
-    "keywords_bigram": "Frekuensi frasa dua kata (untuk co-occurrence / network di R)",
-}
+# Membuat Tab untuk 2 metode input
+tab1, tab2 = st.tabs(["✍️ Input Manual", "📂 Upload File Excel/CSV (Otomatis)"])
 
+# --- TAB 1: INPUT MANUAL ---
+with tab1:
+    st.markdown("### Tambahkan Data Secara Manual")
+    with st.form("form_manual"):
+        col1, col2 = st.columns(2)
+        with col1:
+            ti = st.text_input("Judul Standar (TI) *", placeholder="Cth: ISO 15118-1: Road vehicles...")
+            so = st.text_input("Organisasi/Penerbit (SO)", placeholder="Cth: ISO")
+            py = st.text_input("Tahun Terbit (PY)", placeholder="Cth: 2023")
+        with col2:
+            au = st.text_input("Komite Teknis (AU)", placeholder="Cth: ISO/TC 22")
+            de = st.text_input("Kata Kunci (DE)", placeholder="Pisahkan dengan titik koma (;). Cth: EV; Battery")
+            dt = st.text_input("Tipe Dokumen (DT)", value="Standard", disabled=True)
+        
+        ab = st.text_area("Ruang Lingkup / Scope (AB) *", placeholder="Copy-paste paragraf scope standar di sini. R-Studio akan membaca teks ini...", height=150)
+        
+        submit_btn = st.form_submit_button("Tambahkan ke Tabel")
+        
+        if submit_btn:
+            if ti and ab:
+                new_data = {'TI': ti, 'AB': ab, 'PY': py, 'SO': so, 'AU': au, 'DT': 'Standard', 'DE': de}
+                st.session_state.df_standar = pd.concat([st.session_state.df_standar, pd.DataFrame([new_data])], ignore_index=True)
+                st.success(f"Standar '{ti}' berhasil ditambahkan!")
+            else:
+                st.error("Judul (TI) dan Ruang Lingkup (AB) wajib diisi!")
 
-@st.cache_data(show_spinner=False)
-def run_parser(data: bytes, name: str, first, last, strip, skip):
-    return parse_iso_pdf(io.BytesIO(data), name, first_page=first, last_page=last,
-                         strip_margins=strip, skip_front_matter=skip)
-
-
-def to_csv_bytes(df: pd.DataFrame, bom: bool) -> bytes:
-    return df.to_csv(index=False, encoding="utf-8-sig" if bom else "utf-8").encode(
-        "utf-8-sig" if bom else "utf-8")
-
-
-def safe(s: str) -> str:
-    return re.sub(r"[^A-Za-z0-9_.-]+", "_", s).strip("_")
-
-
-with st.sidebar:
-    st.header("Opsi")
-    strip = st.checkbox("Hapus header/footer berulang", True)
-    skip = st.checkbox("Lewati front matter (cover, daftar isi, foreword)", True,
-                       help="Parsing dimulai dari halaman yang memuat '1 Scope'.")
-    use_range = st.checkbox("Batasi rentang halaman PDF", False)
-    first = last = None
-    if use_range:
-        first = st.number_input("Halaman awal", 1, 2000, 1)
-        last = st.number_input("Halaman akhir", 1, 2000, 50)
-    bom = st.checkbox("Encoding UTF-8 dengan BOM (untuk dibuka di Excel)", False,
-                      help="Untuk R cukup UTF-8 biasa: read_csv() / read.csv(fileEncoding='UTF-8').")
-    per_table = st.checkbox("Sertakan 1 CSV per tabel di ZIP", True)
-
-files = st.file_uploader("Pilih PDF standar ISO", type="pdf", accept_multiple_files=True)
-
-if not files:
-    st.info("Belum ada file. Contoh: ISO 15118-8:2020.")
-    st.stop()
-
-all_results, combined = {}, {}
-for f in files:
-    with st.spinner(f"Memproses {f.name} ..."):
+# --- TAB 2: UPLOAD EXCEL/CSV ---
+with tab2:
+    st.markdown("### Upload Data yang Sudah Ada")
+    st.write("Jika Anda sudah punya daftar judul di Excel, upload di sini. Pastikan file Anda memiliki kolom untuk Judul, Scope, Tahun, dll.")
+    uploaded_file = st.file_uploader("Upload Excel (.xlsx) atau CSV", type=["xlsx", "csv"])
+    
+    if uploaded_file:
         try:
-            res = run_parser(f.getvalue(), f.name, first, last, strip, skip)
-        except Exception as e:  # noqa: BLE001
-            st.error(f"Gagal memproses {f.name}: {e}")
-            continue
-    all_results[f.name] = res
-    for k, df in res.items():
-        if k != "_tables" and len(df):
-            combined.setdefault(k, []).append(df)
+            if uploaded_file.name.endswith('.csv'):
+                df_upload = pd.read_csv(uploaded_file)
+            else:
+                df_upload = pd.read_excel(uploaded_file)
+            
+            st.write("Preview Data Anda:")
+            st.dataframe(df_upload.head(3))
+            
+            st.markdown("#### Petakan Kolom (Mapping)")
+            st.write("Pilih nama kolom di file Anda yang sesuai dengan kode Scopus:")
+            
+            col_options = ["(Kosong)"] + list(df_upload.columns)
+            
+            map_ti = st.selectbox("Kolom untuk Judul (TI):", col_options)
+            map_ab = st.selectbox("Kolom untuk Scope/Abstrak (AB):", col_options)
+            map_py = st.selectbox("Kolom untuk Tahun (PY):", col_options)
+            map_so = st.selectbox("Kolom untuk Penerbit (SO):", col_options)
+            
+            if st.button("Proses dan Gabungkan Data"):
+                temp_df = pd.DataFrame()
+                if map_ti != "(Kosong)": temp_df['TI'] = df_upload[map_ti]
+                if map_ab != "(Kosong)": temp_df['AB'] = df_upload[map_ab]
+                if map_py != "(Kosong)": temp_df['PY'] = df_upload[map_py]
+                if map_so != "(Kosong)": temp_df['SO'] = df_upload[map_so]
+                temp_df['DT'] = "Standard"
+                
+                # Isi kolom yang tidak dipetakan dengan NaN
+                for col in ['TI', 'AB', 'PY', 'SO', 'AU', 'DE']:
+                    if col not in temp_df.columns:
+                        temp_df[col] = ""
+                        
+                st.session_state.df_standar = pd.concat([st.session_state.df_standar, temp_df], ignore_index=True)
+                st.success("Data berhasil diproses dan digabungkan!")
+        except Exception as e:
+            st.error(f"Terjadi kesalahan saat membaca file: {e}")
 
-if not all_results:
-    st.stop()
-
-# ----------------------------------------------------------------------- UI
-tabs = st.tabs(["Ringkasan"] + [k for k in DESCRIPTIONS if k != "document_info"])
-with tabs[0]:
-    info = pd.concat(combined["document_info"], ignore_index=True)
-    st.dataframe(info, use_container_width=True)
-
-for tab, key in zip(tabs[1:], [k for k in DESCRIPTIONS if k != "document_info"]):
-    with tab:
-        st.caption(DESCRIPTIONS[key])
-        if key in combined:
-            df = pd.concat(combined[key], ignore_index=True)
-            st.write(f"{len(df):,} baris × {df.shape[1]} kolom")
-            st.dataframe(df, use_container_width=True, height=420)
-            st.download_button(f"⬇️ {key}.csv", to_csv_bytes(df, bom), f"{key}.csv", "text/csv", key=f"dl_{key}")
-        else:
-            st.warning("Tidak ada data terdeteksi untuk bagian ini.")
-
-# ----------------------------------------------------------------------- ZIP
-buf = io.BytesIO()
-with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
-    for key, dfs in combined.items():
-        z.writestr(f"{key}.csv", to_csv_bytes(pd.concat(dfs, ignore_index=True), bom))
-    if per_table:
-        for name, res in all_results.items():
-            for tid, tdf in res["_tables"].items():
-                z.writestr(f"tables/{safe(res['document_info'].loc[0, 'doc_id'])}_{safe(tid)}.csv",
-                           to_csv_bytes(tdf, bom))
-    z.writestr("read_in_R.R", """library(readr)
-library(dplyr)
-
-dir <- "."   # folder hasil ekstrak ZIP
-clauses      <- read_csv(file.path(dir, "clauses.csv"))
-requirements <- read_csv(file.path(dir, "requirements.csv"))
-terms        <- read_csv(file.path(dir, "terms.csv"))
-kw           <- read_csv(file.path(dir, "keywords_unigram.csv"))
-
-requirements %>% count(modality)                       # shall / should / may / can
-requirements %>% count(clause_id, sort = TRUE)         # sebaran requirement per klausul
-# word cloud / treemap seperti di jurnal Gupta & Kumar (2022):
-# wordcloud::wordcloud(kw$word, kw$n, max.words = 100)
-""")
+# --- TAMPILAN TABEL AKHIR & DOWNLOAD ---
 st.divider()
-st.download_button("📦 Unduh semua CSV (ZIP)", buf.getvalue(), "iso_csv_output.zip", "application/zip",
-                   type="primary")
+st.markdown("### 📊 Tabel Hasil Akhir")
+st.write("Data di bawah ini sudah siap diunduh dan dimasukkan ke R-Studio.")
 
-with st.expander("Cara membaca di R / RStudio"):
-    st.code('''library(readr)
-req <- read_csv("requirements.csv")        # UTF-8
-table(req$modality)
+# Tombol untuk mereset data
+if st.button("Hapus Semua Data"):
+    st.session_state.df_standar = pd.DataFrame(columns=['TI', 'AB', 'PY', 'SO', 'AU', 'DT', 'DE'])
+    st.rerun()
 
-# banyak dokumen sekaligus: kolom doc_id sudah ada di setiap CSV, jadi bisa digabung / di-group_by
-''', language="r")
+st.dataframe(st.session_state.df_standar)
+
+# Logika untuk Download CSV
+if not st.session_state.df_standar.empty:
+    csv = st.session_state.df_standar.to_csv(index=False, encoding='utf-8')
+    st.download_button(
+        label="📥 Download CSV untuk Biblioshiny",
+        data=csv,
+        file_name='Standar_EV_Biblioshiny.csv',
+        mime='text/csv'
+    )
+else:
+    st.info("Tabel masih kosong. Silakan isi data di atas terlebih dahulu untuk memunculkan tombol Download.")
